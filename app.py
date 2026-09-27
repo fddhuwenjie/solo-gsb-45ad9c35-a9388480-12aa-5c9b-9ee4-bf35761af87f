@@ -11,6 +11,7 @@ import scheduler
 import water_quality as wq
 import disease_trace as dt
 import crop_heat as ch
+import drip_uniform as dri
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "data", "irrigation.db"))
@@ -153,6 +154,40 @@ def init_db():
             ON heat_readings(batch_id, ts);
         CREATE INDEX IF NOT EXISTS idx_heat_batches_zone
             ON heat_batches(zone_id);
+        CREATE TABLE IF NOT EXISTS drip_rounds (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            name      TEXT NOT NULL,
+            valve_id  INTEGER NOT NULL REFERENCES valves(id) ON DELETE RESTRICT,
+            inspected TEXT NOT NULL,
+            note      TEXT NOT NULL DEFAULT '',
+            created   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_drip_rounds_inspected
+            ON drip_rounds(inspected, id);
+        CREATE TABLE IF NOT EXISTS drip_zones (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id             INTEGER NOT NULL REFERENCES drip_rounds(id) ON DELETE CASCADE,
+            zone_id              INTEGER REFERENCES zones(id) ON DELETE SET NULL,
+            -- 分区名称快照：巡检时归属阀门下的分区即使日后改名 / 删除，历史轮次台账不丢失
+            zone_name            TEXT NOT NULL,
+            inlet_pressure       REAL,
+            base_inlet_pressure  REAL NOT NULL,
+            design_flow          REAL NOT NULL,
+            du_min               REAL NOT NULL,
+            tail_drop_limit      REAL NOT NULL,
+            low_flow_ratio       REAL NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_drip_zones_round_zone
+            ON drip_zones(round_id, zone_id);
+        CREATE TABLE IF NOT EXISTS drip_samples (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            drip_zone_id INTEGER NOT NULL REFERENCES drip_zones(id) ON DELETE CASCADE,
+            position    TEXT NOT NULL CHECK (position IN ('head','middle','tail')),
+            label       TEXT NOT NULL,
+            flow        REAL NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_drip_samples_zone_pos_label
+            ON drip_samples(drip_zone_id, position, label);
         """
     )
     _migrate_db(db)
@@ -169,6 +204,8 @@ def init_db():
         _seed_disease(db)
     if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
         _seed_heat(db)
+    if db.execute("SELECT COUNT(*) FROM drip_rounds").fetchone()[0] == 0:
+        _seed_drip(db)
     db.close()
 
 
@@ -447,6 +484,107 @@ def _seed_heat(db):
     db.commit()
 
 
+# ---------------------------------------------------------------- 滴灌巡检示例数据
+
+def _seed_drip(db):
+    """两轮滴灌均匀度巡检示例，覆盖三类关键判定。
+
+    一轮（中部干管 · 秋茬滴灌首轮巡检）：
+      黄瓜区 = 支管压损（压力合格、DU 不合格、尾首降幅达阈值）；
+      草莓区 = 合格但 1 个采样点低于堵塞阈值（疑似滴头堵塞）；
+      叶菜区 = 入口压力偏低但 DU 合格（共享供压候选，仅 1/3 不触发）。
+    二轮（中部干管 · 供压异常复核巡检）：
+      3/3 分区入口压力低于基准且 DU 合格 -> 整轮共享供压异常。
+    """
+    now = datetime.now().replace(microsecond=0)
+    valve = db.execute("SELECT id FROM valves WHERE name=?", ("中部干管",)).fetchone()
+    zone_rows = db.execute(
+        "SELECT id,name FROM zones WHERE name IN ('黄瓜区','草莓区','叶菜区')").fetchall()
+    if valve is None or len(zone_rows) < 3:
+        return  # 示例阀门 / 分区被清空时不强行演示
+    valve_id = valve["id"]
+    zone_by_name = {r["name"]: r["id"] for r in zone_rows}
+
+    # 基准入口压力 0.10 MPa、设计滴头流量 2.0 L/h、DU 下限 0.80、
+    # 尾首降幅阈值 10%、低流量比例 0.70（堵塞阈值 1.4 L/h）
+    cfg = (0.10, 2.0, 0.80, 0.10, 0.70)
+
+    def make_samples(spec):
+        """spec: {position: [flow, ...]} -> [(position, label, flow)]。
+
+        各段按首/中/尾各自从 1 号开始编号，与田间编号习惯一致。
+        """
+        out = []
+        prefix = {"head": "H", "middle": "M", "tail": "T"}
+        for pos, flows in spec.items():
+            for i, f in enumerate(flows, 1):
+                out.append((pos, f"{prefix[pos]}{i:02d}", f))
+        return out
+
+    rounds = [
+        ("秋茬滴灌首轮巡检", 2, [
+            # (分区名, 实测入口压力, 样本)
+            ("黄瓜区", 0.12, {
+                # 首段接近设计流量，向尾段明显衰减 -> DU≈0.687、尾首降幅 42.2%
+                "head": [1.95, 2.00, 2.05, 1.90, 2.00, 1.98, 2.02, 1.96],
+                "middle": [1.70, 1.55, 1.60, 1.75, 1.50],
+                "tail": [1.20, 1.05, 1.15, 1.30, 0.95],
+            }),
+            ("草莓区", 0.11, {
+                # 整体均匀，仅 H01 段一个 1.1 L/h 滴头 < 堵塞阈值 1.4
+                "head": [2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 1.10],
+                "middle": [2.00, 2.00, 2.00, 2.00],
+                "tail": [1.95, 1.95, 1.95],
+            }),
+            ("叶菜区", 0.08, {
+                # 压力偏低但均匀度仍合格
+                "head": [2.00, 2.00, 2.00],
+                "middle": [1.95, 2.00, 1.90],
+                "tail": [1.90, 1.95, 2.00, 1.95],
+            }),
+        ]),
+        ("供压异常复核巡检", 0, [
+            # 三个分区入口压力全部低于基准、DU 全部合格 -> 2*3>3 共享供压异常
+            ("黄瓜区", 0.07, {
+                "head": [1.70, 1.65, 1.72, 1.68, 1.70, 1.66, 1.74, 1.69],
+                "middle": [1.65, 1.70, 1.62, 1.68, 1.66],
+                "tail": [1.60, 1.64, 1.58, 1.62, 1.66],
+            }),
+            ("草莓区", 0.07, {
+                "head": [1.70, 1.68, 1.72, 1.66, 1.70, 1.69],
+                "middle": [1.65, 1.68, 1.63, 1.66],
+                "tail": [1.62, 1.65, 1.60, 1.64],
+            }),
+            ("叶菜区", 0.06, {
+                "head": [1.60, 1.58, 1.62],
+                "middle": [1.55, 1.60, 1.57],
+                "tail": [1.52, 1.56, 1.54, 1.58],
+            }),
+        ]),
+    ]
+
+    for rname, days_ago, zones in rounds:
+        inspected = (now - timedelta(days=days_ago)).replace(
+            hour=9, minute=0, second=0).isoformat()
+        rc = db.execute(
+            "INSERT INTO drip_rounds(name,valve_id,inspected,note,created)"
+            " VALUES(?,?,?,?,?)",
+            (rname, valve_id, inspected, "内置示例巡检", now.isoformat()))
+        rid = rc.lastrowid
+        for zname, inlet, spec in zones:
+            zc = db.execute(
+                "INSERT INTO drip_zones(round_id,zone_id,zone_name,inlet_pressure,"
+                "base_inlet_pressure,design_flow,du_min,tail_drop_limit,low_flow_ratio)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (rid, zone_by_name[zname], zname, inlet, *cfg))
+            dzid = zc.lastrowid
+            for pos, label, flow in make_samples(spec):
+                db.execute(
+                    "INSERT INTO drip_samples(drip_zone_id,position,label,flow)"
+                    " VALUES(?,?,?,?)", (dzid, pos, label, flow))
+    db.commit()
+
+
 # ---------------------------------------------------------------- 序列化
 
 def valve_dict(row):
@@ -682,19 +820,26 @@ def api_reset():
     data = request.get_json(silent=True) or {}
     db = get_db()
     db.executescript(
+        "DELETE FROM drip_samples; DELETE FROM drip_zones; DELETE FROM drip_rounds; "
         "DELETE FROM heat_readings; DELETE FROM heat_batches; "
-        "DELETE FROM schedule_items; DELETE FROM zones; "
+        "DELETE FROM schedule_items; "
+        # 全量重置轮灌对象：病害 / 水质历史保留，仅解除事件对旧分区的外键引用
+        # （disease_events.zone_id 为 RESTRICT，直接删 zones 会触发外键约束）
+        "UPDATE disease_events SET zone_id=NULL; "
+        "DELETE FROM zones; "
         "DELETE FROM blackouts; DELETE FROM valves;"
     )
     if data.get("sample"):
         _seed_sample(db)
-        # 分区重建后补回水质 / 病害 / 积温示例（水源与案件如已被用户保留则不重复）
+        # 分区重建后补回水质 / 病害 / 积温 / 滴灌示例（水源与案件如已被用户保留则不重复）
         if db.execute("SELECT COUNT(*) FROM water_sources").fetchone()[0] == 0:
             _seed_water(db)
         if db.execute("SELECT COUNT(*) FROM disease_tools").fetchone()[0] == 0:
             _seed_disease(db)
         if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
             _seed_heat(db)
+        if db.execute("SELECT COUNT(*) FROM drip_rounds").fetchone()[0] == 0:
+            _seed_drip(db)
     else:
         db.execute("UPDATE settings SET value='100' WHERE key='total_flow'")
         db.commit()
@@ -749,6 +894,10 @@ def api_delete_valve(vid):
     used = db.execute("SELECT COUNT(*) c FROM zones WHERE valve_id=?", (vid,)).fetchone()["c"]
     if used:
         return bad(f"仍有 {used} 个分区使用该阀门，请先改绑或删除分区")
+    drip_used = db.execute(
+        "SELECT COUNT(*) c FROM drip_rounds WHERE valve_id=?", (vid,)).fetchone()["c"]
+    if drip_used:
+        return bad(f"该阀门下仍有 {drip_used} 轮滴灌巡检记录，请先删除巡检轮次")
     db.execute("DELETE FROM valves WHERE id=?", (vid,))
     db.commit()
     return jsonify(build_state())
@@ -821,6 +970,11 @@ def api_delete_zone(zid):
         "SELECT COUNT(*) c FROM heat_batches WHERE zone_id=?", (zid,)).fetchone()["c"]
     if heat_used:
         return bad(f"该分区下仍有 {heat_used} 个积温批次，请先删除批次后再删除分区")
+    drip_used = db.execute(
+        "SELECT COUNT(*) c FROM drip_zones WHERE zone_id=?", (zid,)).fetchone()["c"]
+    if drip_used:
+        return bad(f"该分区在 {drip_used} 轮滴灌均匀度巡检中已有记录，"
+                   "请先删除对应巡检轮次后再删除分区")
     db.execute("DELETE FROM schedule_items WHERE zone_id=?", (zid,))
     # 冻结案件的重放结果已固化为快照，历史事件解除分区引用后即可删除
     db.execute("UPDATE disease_events SET zone_id=NULL WHERE zone_id=?", (zid,))
@@ -1806,6 +1960,368 @@ def api_heat_delete_reading(reading_id):
     db.commit()
     # 删除后按时间全量重算
     return jsonify(build_heat_state(row["batch_id"]))
+
+
+# ---------------------------------------------------------------- API: 滴灌均匀度巡检
+
+def _drip_zone_samples(db, dzid):
+    rows = db.execute(
+        "SELECT id,position,label,flow FROM drip_samples WHERE drip_zone_id=?"
+        " ORDER BY position,label,id", (dzid,)).fetchall()
+    return [{"id": r["id"], "drip_zone_id": dzid, "position": r["position"],
+             "label": r["label"], "flow": r["flow"]} for r in rows]
+
+
+def _drip_zone_payload(db, row):
+    """组装单个巡检分区的重算输入（含全部样本，按首/中/尾编号）。"""
+    return {
+        "drip_zone_id": row["id"],
+        "zone_id": row["zone_id"],
+        "zone_name": row["zone_name"],
+        "inlet_pressure": row["inlet_pressure"],
+        "base_inlet_pressure": row["base_inlet_pressure"],
+        "design_flow": row["design_flow"],
+        "du_min": row["du_min"],
+        "tail_drop_limit": row["tail_drop_limit"],
+        "low_flow_ratio": row["low_flow_ratio"],
+        "samples": _drip_zone_samples(db, row["id"]),
+    }
+
+
+def _drip_round_compute(db, round_row):
+    """取整轮全部分区与样本整体重算。"""
+    zrows = db.execute("SELECT * FROM drip_zones WHERE round_id=? ORDER BY id",
+                       (round_row["id"],)).fetchall()
+    payloads = [_drip_zone_payload(db, r) for r in zrows]
+    result = dri.evaluate_round(payloads)
+    # 结果区卡回填样本明细（供前端明细表删除 / 筛选；evaluate_round 不消费此字段）
+    for zout, pin in zip(result["zones"], payloads):
+        zout["samples"] = pin["samples"]
+    return result
+
+
+def _drip_round_dict(db, row, valve_by_id, with_result=True):
+    valve = valve_by_id.get(row["valve_id"])
+    out = {
+        "id": row["id"],
+        "name": row["name"],
+        "valve_id": row["valve_id"],
+        "valve_name": valve["name"] if valve else "（阀门已删除）",
+        "inspected": row["inspected"],
+        "note": row["note"],
+        "created": row["created"],
+    }
+    if with_result:
+        result = _drip_round_compute(db, row)
+        out["result"] = result
+        out["zone_count"] = result["zone_count"]
+        out["sample_count"] = sum(z["sample_count"] for z in result["zones"])
+    return out
+
+
+def _drip_valves_zones(db):
+    valves = [valve_dict(r) for r in db.execute("SELECT * FROM valves ORDER BY id")]
+    valve_by_id = {v["id"]: v for v in valves}
+    zones = [zone_dict(r, valve_by_id)
+             for r in db.execute("SELECT * FROM zones ORDER BY id")]
+    return valves, valve_by_id, zones
+
+
+def build_drip_state(round_id=None, valve_id=None, day=None):
+    db = get_db()
+    valves, valve_by_id, zones = _drip_valves_zones(db)
+
+    sql = "SELECT * FROM drip_rounds WHERE 1=1"
+    args = []
+    if valve_id is not None:
+        sql += " AND valve_id=?"
+        args.append(valve_id)
+    if day:
+        sql += " AND substr(inspected,1,10)=?"
+        args.append(day)
+    sql += " ORDER BY inspected DESC,id DESC"
+    rows = db.execute(sql, args).fetchall()
+
+    if round_id is None and valve_id is None and day is None and rows:
+        round_id = rows[0]["id"]
+    selected_row = next((r for r in rows if r["id"] == round_id), None)
+    if round_id is not None and selected_row is None:
+        raise KeyError("巡检轮次不存在")
+
+    # 列表卡只带轻量汇总（整轮仍重算，保证补录后卡片计数同步）
+    cards = []
+    for r in rows:
+        result = _drip_round_compute(db, r)
+        cards.append({
+            "id": r["id"], "name": r["name"],
+            "valve_id": r["valve_id"],
+            "valve_name": valve_by_id.get(r["valve_id"], {}).get("name", "（阀门已删除）"),
+            "inspected": r["inspected"], "note": r["note"],
+            "zone_count": result["zone_count"],
+            "evaluated_count": result["evaluated_count"],
+            "du_pass_count": result["du_pass_count"],
+            "sample_count": sum(z["sample_count"] for z in result["zones"]),
+            "verdict": result["verdict"],
+            "verdict_label": result["verdict_label"],
+        })
+
+    selected = None
+    if selected_row is not None:
+        selected = _drip_round_dict(db, selected_row, valve_by_id)
+
+    # 新建轮次时的可选分区：归属于所选阀门的分区
+    available = None
+    if valve_id is not None:
+        available = [{"id": z["id"], "name": z["name"],
+                      "valve_id": z["valve_id"], "valve_name": z["valve_name"]}
+                     for z in zones if z["valve_id"] == valve_id]
+
+    return {
+        "valves": valves,
+        "zones": [{"id": z["id"], "name": z["name"], "valve_id": z["valve_id"],
+                   "valve_name": z["valve_name"]} for z in zones],
+        "filter_valve_id": valve_id,
+        "filter_date": day or "",
+        "rounds": cards,
+        "selected_id": selected_row["id"] if selected_row else None,
+        "selected": selected,
+        "available_zones": available,
+    }
+
+
+def build_drip_export(round_id=None, valve_id=None, day=None):
+    state = build_drip_state(round_id, valve_id, day)
+    if state["selected"] is not None:
+        rounds = state["selected"]
+    else:
+        rounds = [{"id": c["id"], **c} for c in state["rounds"]]
+    return {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "filter_valve_id": state["filter_valve_id"],
+        "filter_date": state["filter_date"],
+        "selected_id": state["selected_id"],
+        "valves": state["valves"],
+        "rounds": rounds,
+    }
+
+
+def _read_drip_round_payload(db, data):
+    """校验轮次表单：名称、阀门、巡检时间、以及各分区的五个参数 + 入口压力。"""
+    name = (data.get("name") or "").strip()
+    if not name:
+        raise ValueError("缺少字段：巡检名称")
+    try:
+        valve_id = int(data.get("valve_id"))
+    except (TypeError, ValueError):
+        raise ValueError("请选择巡检阀门")
+    if not db.execute("SELECT 1 FROM valves WHERE id=?", (valve_id,)).fetchone():
+        raise ValueError("请选择有效阀门")
+    inspected = dri.parse_ts(data.get("inspected"))
+    note = (data.get("note") or "").strip()
+
+    raw_zones = data.get("zones")
+    if not isinstance(raw_zones, list) or not raw_zones:
+        raise ValueError("请至少为一个阀门下分区配置巡检参数")
+    bound = {r["id"] for r in db.execute(
+        "SELECT id FROM zones WHERE valve_id=?", (valve_id,))}
+    seen = set()
+    zones = []
+    for i, z in enumerate(raw_zones):
+        where = f"第 {i + 1} 个分区"
+        try:
+            zone_id = int(z.get("zone_id"))
+        except (TypeError, ValueError):
+            raise ValueError(f"{where}：请选择分区")
+        if zone_id not in bound:
+            raise ValueError(f"{where}：分区不属于所选阀门")
+        if zone_id in seen:
+            raise ValueError(f"{where}：分区重复配置")
+        seen.add(zone_id)
+        cfg = dri.validate_config(z)
+        inlet = dri.validate_inlet_pressure(z.get("inlet_pressure"), required=False)
+        zones.append({"zone_id": zone_id, "inlet_pressure": inlet, **cfg})
+    return name, valve_id, inspected, note, zones
+
+
+def _replace_drip_zones(db, round_id, zones):
+    """按提交内容整表替换轮次分区参数；被移除 / 不存在的旧分区行连同样本删除。"""
+    name_by_id = {r["id"]: r["name"]
+                  for r in db.execute("SELECT id,name FROM zones")}
+    keep = {z["zone_id"] for z in zones}
+    old_rows = db.execute("SELECT id,zone_id FROM drip_zones WHERE round_id=?",
+                          (round_id,)).fetchall()
+    for r in old_rows:
+        if r["zone_id"] not in keep:
+            db.execute("DELETE FROM drip_samples WHERE drip_zone_id=?", (r["id"],))
+            db.execute("DELETE FROM drip_zones WHERE id=?", (r["id"],))
+    for z in zones:
+        old = db.execute(
+            "SELECT id FROM drip_zones WHERE round_id=? AND zone_id=?",
+            (round_id, z["zone_id"])).fetchone()
+        if old:
+            db.execute(
+                "UPDATE drip_zones SET zone_name=?,inlet_pressure=?,"
+                "base_inlet_pressure=?,design_flow=?,du_min=?,"
+                "tail_drop_limit=?,low_flow_ratio=? WHERE id=?",
+                (name_by_id.get(z["zone_id"], f"分区#{z['zone_id']}"),
+                 z["inlet_pressure"], z["base_inlet_pressure"], z["design_flow"],
+                 z["du_min"], z["tail_drop_limit"], z["low_flow_ratio"], old["id"]))
+        else:
+            db.execute(
+                "INSERT INTO drip_zones(round_id,zone_id,zone_name,inlet_pressure,"
+                "base_inlet_pressure,design_flow,du_min,tail_drop_limit,low_flow_ratio)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (round_id, z["zone_id"], name_by_id.get(z["zone_id"], "已删除分区"),
+                 z["inlet_pressure"], z["base_inlet_pressure"], z["design_flow"],
+                 z["du_min"], z["tail_drop_limit"], z["low_flow_ratio"]))
+
+
+@app.route("/drip")
+def drip_page():
+    return send_from_directory(app.static_folder, "drip.html")
+
+
+@app.get("/api/drip/state")
+def api_drip_state():
+    round_id = request.args.get("round_id", type=int)
+    valve_id = request.args.get("valve_id", type=int)
+    day = (request.args.get("date") or "").strip() or None
+    try:
+        return jsonify(build_drip_state(round_id, valve_id, day))
+    except KeyError:
+        return bad("巡检轮次不存在", 404)
+
+
+@app.get("/api/drip/export")
+def api_drip_export():
+    round_id = request.args.get("round_id", type=int)
+    valve_id = request.args.get("valve_id", type=int)
+    day = (request.args.get("date") or "").strip() or None
+    try:
+        payload = build_drip_export(round_id, valve_id, day)
+    except KeyError:
+        return bad("巡检轮次不存在", 404)
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    if round_id is not None:
+        fname = f"drip-uniformity-round-{round_id}.json"
+    else:
+        tag = day or "all"
+        fname = f"drip-uniformity-{valve_id or 'all'}-{tag}.json"
+    resp = Response(body, mimetype="application/json; charset=utf-8")
+    resp.headers["Content-Disposition"] = \
+        f"attachment; filename=drip-uniformity.json; filename*=UTF-8''{fname}"
+    return resp
+
+
+# ---- 轮次 ----
+
+@app.post("/api/drip/rounds")
+def api_drip_create_round():
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        name, valve_id, inspected, note, zones = _read_drip_round_payload(db, data)
+    except ValueError as e:
+        return bad(str(e))
+    cur = db.execute(
+        "INSERT INTO drip_rounds(name,valve_id,inspected,note,created) VALUES(?,?,?,?,?)",
+        (name, valve_id, inspected, note,
+         datetime.now().replace(microsecond=0).isoformat()))
+    rid = cur.lastrowid
+    _replace_drip_zones(db, rid, zones)
+    db.commit()
+    return jsonify(build_drip_state(rid)), 201
+
+
+@app.put("/api/drip/rounds/<int:round_id>")
+def api_drip_update_round(round_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    if not db.execute("SELECT 1 FROM drip_rounds WHERE id=?", (round_id,)).fetchone():
+        return bad("巡检轮次不存在", 404)
+    try:
+        name, valve_id, inspected, note, zones = _read_drip_round_payload(db, data)
+    except ValueError as e:
+        return bad(str(e))
+    db.execute("UPDATE drip_rounds SET name=?,valve_id=?,inspected=?,note=? WHERE id=?",
+               (name, valve_id, inspected, note, round_id))
+    _replace_drip_zones(db, round_id, zones)
+    db.commit()
+    return jsonify(build_drip_state(round_id))
+
+
+@app.delete("/api/drip/rounds/<int:round_id>")
+def api_drip_delete_round(round_id):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM drip_rounds WHERE id=?", (round_id,)).fetchone():
+        return bad("巡检轮次不存在", 404)
+    zrows = db.execute("SELECT id FROM drip_zones WHERE round_id=?", (round_id,)).fetchall()
+    for r in zrows:
+        db.execute("DELETE FROM drip_samples WHERE drip_zone_id=?", (r["id"],))
+    db.execute("DELETE FROM drip_zones WHERE round_id=?", (round_id,))
+    db.execute("DELETE FROM drip_rounds WHERE id=?", (round_id,))
+    db.commit()
+    return jsonify(build_drip_state())
+
+
+# ---- 分区参数 / 入口压力（保存后整轮重算） ----
+
+@app.put("/api/drip/zones/<int:dz_id>")
+def api_drip_update_zone(dz_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    row = db.execute("SELECT * FROM drip_zones WHERE id=?", (dz_id,)).fetchone()
+    if not row:
+        return bad("巡检分区不存在", 404)
+    try:
+        cfg = dri.validate_config(data)
+        inlet = dri.validate_inlet_pressure(data.get("inlet_pressure"), required=False)
+    except ValueError as e:
+        return bad(str(e))
+    db.execute(
+        "UPDATE drip_zones SET inlet_pressure=?,base_inlet_pressure=?,"
+        "design_flow=?,du_min=?,tail_drop_limit=?,low_flow_ratio=? WHERE id=?",
+        (inlet, cfg["base_inlet_pressure"], cfg["design_flow"], cfg["du_min"],
+         cfg["tail_drop_limit"], cfg["low_flow_ratio"], dz_id))
+    db.commit()
+    return jsonify(build_drip_state(row["round_id"]))
+
+
+# ---- 样本录入 / 删除（补录或删除后整轮重算） ----
+
+@app.post("/api/drip/zones/<int:dz_id>/samples")
+def api_drip_add_samples(dz_id):
+    data = request.get_json(silent=True)
+    db = get_db()
+    row = db.execute("SELECT round_id FROM drip_zones WHERE id=?", (dz_id,)).fetchone()
+    if not row:
+        return bad("巡检分区不存在", 404)
+    try:
+        cleaned = dri.validate_samples(data)
+    except ValueError as e:
+        return bad(str(e))
+    try:
+        for s in cleaned:
+            db.execute(
+                "INSERT INTO drip_samples(drip_zone_id,position,label,flow) VALUES(?,?,?,?)",
+                (dz_id, s["position"], s["label"], s["flow"]))
+        db.commit()
+    except sqlite3.IntegrityError:
+        return bad("同段滴头编号已存在，请检查编号（首 / 中 / 尾分别编号）")
+    return jsonify(build_drip_state(row["round_id"])), 201
+
+
+@app.delete("/api/drip/samples/<int:sample_id>")
+def api_drip_delete_sample(sample_id):
+    db = get_db()
+    row = db.execute(
+        "SELECT z.round_id FROM drip_samples s JOIN drip_zones z"
+        " ON z.id=s.drip_zone_id WHERE s.id=?", (sample_id,)).fetchone()
+    if not row:
+        return bad("采样点不存在", 404)
+    db.execute("DELETE FROM drip_samples WHERE id=?", (sample_id,))
+    db.commit()
+    return jsonify(build_drip_state(row["round_id"]))
 
 
 # ---------------------------------------------------------------- 错误

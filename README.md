@@ -1,11 +1,12 @@
 # 温室分区轮灌编排台
 
-基于 **Python Flask + SQLite + 原生 HTML/CSS/JavaScript** 的温室管理工具，包含四个页面：
+基于 **Python Flask + SQLite + 原生 HTML/CSS/JavaScript** 的温室管理工具，包含五个页面：
 
 1. **温室分区轮灌编排台**（`/`）：以 **15 分钟为最小粒度**，在总流量、阀门并发上限、允许灌溉时段和停水时段四类约束下自动生成一天的轮灌计划，并在时间轴上直观标出冲突原因；支持鼠标拖拽与表单两种方式微调单个时段，即时校验，可保存到数据库并导出 JSON。
 2. **灌溉水质连续监测**（`/water`）：按水源连续录入带时间戳的 **pH / EC / 浊度 / 硝酸盐** 采样，为每个水源配置各指标正常区间，按「连续两次越界判超标、连续两次回归判恢复」的规则重算状态，支持按水源/日期筛选、最近采样趋势图与 JSON 导出。
 3. **病害接触追踪**（`/disease`）：复用现有温室分区，为一次病害确诊登记**可复用工具的分区到访、合格消毒事件及病害确诊**，按时间重放工具—分区之间的污染传播，输出每个分区的**最早暴露时间、最短事件链与待隔离清单**；补录 / 删除事件后自动重算，确认后**冻结案件快照**，支持筛选与 JSON 导出。
 4. **作物积温预测**（`/heat`）：复用现有温室分区，为种植批次设置**基温、上限温度、目标积温与允许采样间隔**，录入带时间戳的温度；温度截断后对相邻读数做**梯形积分并按午夜拆分**，间隔超限**只登记缺口、不累计**；补录 / 删除读数后按时间全量重算，给出**每日积温、累计值、首次达标时刻与缺口清单**，未达标时以最近 7 个无缺口完整日的日均积温外推预计日期（样本不足明确不可预测）；页面展示温度 / 累计积温曲线与每日台账，支持按分区、批次筛选及 JSON 导出。
+5. **滴灌均匀度巡检**（`/drip`）：复用现有阀门与分区，一次巡检选择**一条阀门**并为其下各分区配置**基准入口压力、设计滴头流量、DU 下限、尾首降幅阈值与低流量比例**，录入入口压力及**按首 / 中 / 尾编号**的滴头实测流量；每区至少 8 个样本，按流量升序取 `ceil(n/4)` 个计算**低四分位均值 DU**；超过半数分区同时「入口压力低于基准 + DU 合格」时整轮标记**共享供压异常**，未触发时按规则判**支管压损**与**疑似滴头堵塞**；补录 / 删除样本后整轮重算，输出每区 DU、判定依据与维护清单，支持历史筛选与 JSON 导出。
 
 ## 一键启动（Docker Compose）
 
@@ -19,8 +20,9 @@ docker compose up --build -d
 - 水质监测页：**http://localhost:8000/water**
 - 病害追踪页：**http://localhost:8000/disease**
 - 积温预测页：**http://localhost:8000/heat**
+- 滴灌巡检页：**http://localhost:8000/drip**
 
-四个页面顶部有页签可互相跳转。数据通过 Docker 卷 `irrigation-data` 持久化（容器内 `/app/data/irrigation.db`）。停止与清理：
+五个页面顶部有页签可互相跳转。数据通过 Docker 卷 `irrigation-data` 持久化（容器内 `/app/data/irrigation.db`）。停止与清理：
 
 ```bash
 docker compose down          # 停止（数据保留）
@@ -34,10 +36,10 @@ docker compose down -v       # 停止并删除数据卷
 ```bash
 pip install -r requirements.txt
 python app.py
-# 访问 http://localhost:8000/ 、/water 、/disease 、/heat
+# 访问 http://localhost:8000/ 、/water 、/disease 、/heat 、/drip
 ```
 
-首次启动会自动建库并写入一套内置示例数据（轮灌示例 + 2 个水源的水质历史采样 + 1 个灰霉病病害追踪示例案件 + 2 个作物积温批次）。
+首次启动会自动建库并写入一套内置示例数据（轮灌示例 + 2 个水源的水质历史采样 + 1 个灰霉病病害追踪示例案件 + 2 个作物积温批次 + 2 轮滴灌均匀度巡检）。
 
 ## 功能说明
 
@@ -338,6 +340,172 @@ curl -OJ 'http://localhost:8000/api/heat/export?batch_id=1'
 
 页面侧复核：进入 `/heat`，在左上方筛选器选「黄瓜区」，右侧应出现黄色「⛔ 不可预测：无缺口完整日仅 N 个，不足 7 个，样本不足以外推」，下方「⏭ 缺口清单」列出漏测区间；选回「番茄区」可见绿色外推卡片、温度曲线上的基温/上限虚线与 32 ℃ 红点（按 30 ℃ 截断）、累计曲线上的预计达标标注；在左侧把「目标积温」改小后保存，顶部变为「已达标」并给出首次达标时刻，日台账对应日期高亮。
 
+## 滴灌均匀度巡检（/drip）
+
+复用轮灌台的**阀门与分区**，围绕一条阀门开一轮巡检（如「秋茬滴灌首轮巡检」），录入入口压力与按首 / 中 / 尾编号的滴头实测流量，整轮自动重算 DU 与异常判定。
+
+### 数据模型
+
+- **巡检轮次（drip_rounds）**：名称 + **巡检阀门（一轮一条阀门）** + 巡检时间（本地时间）+ 备注。
+- **巡检分区（drip_zones）**：轮次下该阀门的每个分区一行，保存五项巡检参数与实测入口压力，并冗余分区名称快照（分区日后改名 / 删除不影响历史台账）：
+  - **基准入口压力**（MPa）：入口压力 `<` 基准即供压偏低；
+  - **设计滴头流量**（L/h）：滴头额定流量；
+  - **DU 下限**（如 0.80）：DU `≥` 下限为合格；
+  - **尾首降幅阈值**（如 0.10）：尾段中位数相对首段降幅 `≥` 阈值视为衰减显著；
+  - **低流量比例**（如 0.70）：实测流量 `< 设计流量 × 该比例` 的采样点列为疑似堵塞。
+- **滴头样本（drip_samples）**：每个样本含**管段位置**（`head` 首段 / `middle` 中段 / `tail` 尾段）、**滴头编号**（各段独立编号，如 H01 / M03 / T02）与**实测流量**（L/h）。同分区同段编号唯一，支持补录历史。
+
+### DU 与整轮判定规则
+
+1. **每区至少 8 个样本**才计算 DU；不足 8 个判「样本不足」，不参与整轮多数统计，维护清单提示补录。
+2. **低四分位均值 DU**：样本按流量升序排列，取前 `ceil(n/4)` 个求均值，
+   `DU = 低四分位均值 / 全样本均值`（均值为 0 时 DU 记 0）。
+3. **尾首降幅** = `(首段流量中位数 − 尾段流量中位数) / 首段流量中位数`（首 / 尾段各取该段全部样本的中位数）。
+4. **共享供压异常**：整轮中**严格超过半数**分区同时满足「入口压力低于基准」**且**「DU 合格（≥ 下限）」→ 整轮标记 `shared_pressure`，命中分区标注为「共享供压异常涉及分区」，整轮不再单列支管压损 / 滴头堵塞，维护清单只保留一条泵房 / 干管供压核查项。**入口压力未录入的分区不计入供压偏低**（也不参与共享候选），维护清单单列「补测入口压力」提醒。
+5. **未触发共享供压异常时的分区判定**：
+   - 入口压力合格（`≥` 基准）+ DU 不合格 + 尾首降幅 `≥` 阈值 → **支管压损**（尾段低压导致的不均匀；该分区低流量点按压损解释，**不**列滴头堵塞）；
+   - 入口压力低于基准但 DU 合格 → **入口压力偏低**（同时是共享供压异常候选分区）；
+   - 其余 DU 不合格 → **均匀度异常**，提示现场分段测压复核；
+   - DU 合格 → **合格**。
+6. **疑似滴头堵塞**：未触发共享供压异常、且分区**不是**支管压损时，所有实测流量 `< 设计流量 × 低流量比例` 的采样点逐条列入维护清单（含分区、首/中/尾段、编号与阈值依据）。
+
+每次**新建 / 修改轮次参数、改某分区参数或入口压力、补录 / 删除样本**后，都取整轮全部分区与全部样本**整体重算**（计算模块无状态、结果不缓存）。
+
+### 页面 / 导出
+
+- 左侧：巡检轮次历史列表（按时间倒序，显示阀门、判定徽标、已评分区 / DU 合格数 / 样本数）、新建 / 编辑轮次表单（按所选阀门自动展开其下全部分区的六宫格参数）、滴头样本录入（分区 + 首/中/尾 + 编号 + 流量）。
+- 右侧：整轮总览（命中分区比例、判定规则原文）、**🛠 维护清单**（高/中/低优先级，含处理动作与判定依据）、**分区判定结果卡**（DU、低四分位均值、全样本均值、首/中/尾中位数、尾首降幅、堵塞阈值、逐条判定依据、疑似堵塞芯片，可折叠，可就地修改参数）、**滴头样本明细**（按分区 / 管段 / 仅低流量点筛选，可逐条删除）。
+- 顶部支持按**阀门**与**巡检日期**筛选历史；**⬇ 导出 JSON**：选中轮次时导出该轮完整结果（含每区样本与判定依据），处于筛选状态时导出符合条件的轮次列表。
+- **删除保护**：分区在巡检轮次中有记录时，轮灌台删除分区返回 400；阀门下仍有巡检轮次（或绑定分区）时禁止删除。轮次删除级联其分区行与全部样本。
+
+### 操作示例（API）
+
+```bash
+# 1) 新建巡检轮次（阀门 2 中部干管；为分区 2/3/4 各配五项参数 + 实测入口压力）
+curl -X POST http://localhost:8000/api/drip/rounds \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"秋茬滴灌首轮巡检","valve_id":2,"inspected":"2026-09-27T09:00",
+       "zones":[
+         {"zone_id":2,"inlet_pressure":0.12,"base_inlet_pressure":0.10,"design_flow":2.0,
+          "du_min":0.80,"tail_drop_limit":0.10,"low_flow_ratio":0.70},
+         {"zone_id":3,"inlet_pressure":0.11,"base_inlet_pressure":0.10,"design_flow":2.0,
+          "du_min":0.80,"tail_drop_limit":0.10,"low_flow_ratio":0.70},
+         {"zone_id":4,"inlet_pressure":0.08,"base_inlet_pressure":0.10,"design_flow":2.0,
+          "du_min":0.80,"tail_drop_limit":0.10,"low_flow_ratio":0.70}
+       ]}'
+
+# 2) 为分区录入滴头样本（单条或 {"batch":[...]}；位置 head/middle/tail，编号同段唯一）
+curl -X POST http://localhost:8000/api/drip/zones/1/samples \
+  -H 'Content-Type: application/json' \
+  -d '{"batch":[
+    {"position":"head","label":"H01","flow":1.95},
+    {"position":"head","label":"H02","flow":2.00},
+    {"position":"tail","label":"T01","flow":1.20}
+  ]}'
+
+# 3) 查询整轮重算结果（每区 DU / 判定依据 / 维护清单）
+curl 'http://localhost:8000/api/drip/state?round_id=1'
+
+# 4) 历史筛选（阀门 + 巡检日期）；改入口压力 / 参数；删除样本后整轮重算
+curl 'http://localhost:8000/api/drip/state?valve_id=2&date=2026-09-27'
+curl -X PUT http://localhost:8000/api/drip/zones/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"inlet_pressure":0.11,"base_inlet_pressure":0.10,"design_flow":2.0,
+       "du_min":0.85,"tail_drop_limit":0.10,"low_flow_ratio":0.70}'
+curl -X DELETE http://localhost:8000/api/drip/samples/3
+
+# 5) 导出 JSON（单轮完整结果，或按筛选导出列表）
+curl -OJ 'http://localhost:8000/api/drip/export?round_id=1'
+curl -OJ 'http://localhost:8000/api/drip/export?valve_id=2&date=2026-09-27'
+```
+
+首次启动内置两轮巡检示例（均挂在「中部干管」）：**秋茬滴灌首轮巡检**（黄瓜区支管压损、草莓区合格但 H08 滴头疑似堵塞、叶菜区入口压力偏低但仅 1/3 不触发共享异常）与**供压异常复核巡检**（3/3 分区供压偏低且 DU 合格，整轮判共享供压异常）。
+
+### 复核示例（DU / 支管压损 / 共享供压 / 堵塞）
+
+沿用 Docker Compose 启动（`docker compose up --build -d`），用内置两轮示例复核：
+
+```bash
+# 1) 最近一轮默认选中：应为 shared_pressure，命中 3 区、只产生 1 条共享维护项
+curl -s http://localhost:8000/api/drip/state | python3 -c '
+import sys, json
+r = json.load(sys.stdin)["selected"]["result"]
+print(r["verdict_label"], "|", r["rule"])
+assert r["verdict"] == "shared_pressure" and r["shared_hit_count"] == 3
+assert [m["type"] for m in r["maintenance"]] == ["shared_pressure"]
+for z in r["zones"]:
+    print(f"  {z[\"zone_name\"]}: DU={z[\"du\"]} 压力={z[\"inlet_pressure\"]}/{z[\"base_inlet_pressure\"]}"
+          f" 样本={z[\"sample_count\"]} -> {z[\"verdict_label\"]}")
+'
+
+# 2) 首轮巡检：黄瓜区支管压损（DU≈0.6869、尾首降幅 42.2%）、草莓区 H08 疑似堵塞、
+#    叶菜区入口压力偏低；1/3 未超过半数，不触发共享供压异常
+RID=$(curl -s http://localhost:8000/api/drip/state | python3 -c '
+import sys, json
+for r in json.load(sys.stdin)["rounds"]:
+    if "首轮" in r["name"]: print(r["id"])')
+curl -s "http://localhost:8000/api/drip/state?round_id=$RID" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)["selected"]["result"]
+assert r["verdict"] == "normal", r["verdict"]
+bz = {z["zone_name"]: z for z in r["zones"]}
+assert bz["黄瓜区"]["verdict"] == "pipe_loss" and bz["黄瓜区"]["du"] == 0.6869
+assert bz["黄瓜区"]["low_quarter_count"] == 5          # ceil(17/4)
+assert bz["草莓区"]["verdict"] == "ok"
+assert bz["叶菜区"]["verdict"] == "pressure_low"
+types = sorted(m["type"] for m in r["maintenance"])
+assert types == ["clog", "pipe_loss", "pressure"], types
+clog = next(m for m in r["maintenance"] if m["type"] == "clog")
+assert clog["position"] == "head" and clog["label"] == "H08"
+print("首轮复核通过：", types, "| 堵塞点", clog["basis"])
+'
+
+# 3) 补录 / 删除样本后整轮重算：新建一轮挂在「北侧干管 · 番茄区」，
+#    先录 7 个样本应为「样本不足、DU 不计算」，补到第 8 个后出现 DU
+curl -s http://localhost:8000/api/state | python3 -c '
+import sys, json
+s = json.load(sys.stdin)
+v = next(x["id"] for x in s["valves"] if x["name"] == "北侧干管")
+z = next(x["id"] for x in s["zones"] if x["name"] == "番茄区")
+print(v, z)' > /tmp/vz.txt
+read V Z < /tmp/vz.txt
+RID2=$(curl -s -X POST http://localhost:8000/api/drip/rounds -H "Content-Type: application/json" \
+  -d "{\"name\":\"复核巡检\",\"valve_id\":$V,\"inspected\":\"2026-09-27T10:00\",\"zones\":[\
+{\"zone_id\":$Z,\"inlet_pressure\":0.12,\"base_inlet_pressure\":0.10,\"design_flow\":2.0,\
+\"du_min\":0.80,\"tail_drop_limit\":0.10,\"low_flow_ratio\":0.70}]}" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["selected_id"])')
+DZ=$(curl -s "http://localhost:8000/api/drip/state?round_id=$RID2" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["selected"]["result"]["zones"][0]["drip_zone_id"])')
+for i in 01 02 03 04 05 06 07; do
+  curl -s -o /dev/null -X POST "http://localhost:8000/api/drip/zones/$DZ/samples" \
+    -H 'Content-Type: application/json' -d "{\"position\":\"head\",\"label\":\"H$i\",\"flow\":2.0}"
+done
+curl -s "http://localhost:8000/api/drip/state?round_id=$RID2" | python3 -c '
+import sys, json
+z = json.load(sys.stdin)["selected"]["result"]["zones"][0]
+assert z["verdict"] == "insufficient" and z["du"] is None and z["sample_count"] == 7
+print("7 个样本：样本不足，DU 不计算")'
+curl -s -o /dev/null -X POST "http://localhost:8000/api/drip/zones/$DZ/samples" \
+  -H 'Content-Type: application/json' -d '{"position":"head","label":"H08","flow":2.0}'
+curl -s "http://localhost:8000/api/drip/state?round_id=$RID2" | python3 -c '
+import sys, json
+z = json.load(sys.stdin)["selected"]["result"]["zones"][0]
+assert z["sample_count"] == 8 and z["low_quarter_count"] == 2 and z["du"] == 1.0
+print("8 个样本：ceil(8/4)=2，DU=1.0 合格")'
+
+# 4) 同段编号重复 / 非法位置 / 跨阀门分区均应 400
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8000/api/drip/zones/$DZ/samples" \
+  -H 'Content-Type: application/json' -d '{"position":"head","label":"H01","flow":1.0}'   # 400
+curl -s -o /dev/null -w '%{http_code}\n' -X POST "http://localhost:8000/api/drip/zones/$DZ/samples" \
+  -H 'Content-Type: application/json' -d '{"position":"end","label":"X1","flow":1.0}'    # 400
+
+# 5) 删除保护：有巡检记录的分区 / 阀门不能直接删（先删轮次）
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE "http://localhost:8000/api/zones/2"   # 400
+curl -OJ "http://localhost:8000/api/drip/export?round_id=$RID2"
+```
+
+页面侧复核：进入 `/drip`，默认选中「供压异常复核巡检」，顶部红色徽标「共享供压异常」并给出「3/3 超过半数」规则原文，维护清单只有一条 🚨 泵房 / 干管供压核查；从列表选「秋茬滴灌首轮巡检」，黄瓜区卡片为红色「支管压损」（展开可见 DU 0.6869、首/尾中位数与 42.2% 尾首降幅），草莓区合格且列出红色 H08 堵塞芯片与 🔧 维护项，叶菜区黄色「入口压力偏低」；左上方按「中部干管」筛选只列这两轮，改巡检日期可进一步过滤；在样本明细里删掉 H08 后维护清单同步少一条堵塞项，给某分区补录到 8 个样本后 DU 立即出现，全部为整轮重算结果。
+
 ## 内置示例
 
 
@@ -386,15 +554,23 @@ curl -OJ 'http://localhost:8000/api/heat/export?batch_id=1'
 | POST/PUT/DELETE | `/api/heat/batches[/{id}]` | 积温批次增改删（参数保存 / 删除批次后全量重算；分区有批次时删除分区返回 400） |
 | POST | `/api/heat/batches/{id}/readings` | 录入温度读数；单条对象或 `{"batch":[...]}`，支持补录（同批次时间戳唯一） |
 | DELETE | `/api/heat/readings/{id}` | 删除单条读数并按时间全量重算 |
+| GET | `/drip` | 滴灌均匀度巡检页面 |
+| GET | `/api/drip/state` | 巡检轮次 / 阀门 / 分区及选中轮次整轮重算结果；参数 `round_id`、`valve_id`、`date`（YYYY-MM-DD） |
+| GET | `/api/drip/export` | 按 `round_id` 导出单轮完整结果，或按 `valve_id`/`date` 导出轮次列表 JSON |
+| POST/PUT/DELETE | `/api/drip/rounds[/{id}]` | 巡检轮次增改删（一轮一条阀门；PUT 替换其分区参数；删除级联分区行与样本；阀门 / 分区有巡检记录时禁止删除，返回 400） |
+| PUT | `/api/drip/zones/{id}` | 修改单分区入口压力与五项巡检参数，保存后整轮重算 |
+| POST | `/api/drip/zones/{id}/samples` | 录入滴头样本（首 head / 中 middle / 尾 tail + 编号 + 流量）；单条或 `{"batch":[...]}`，同分区同段编号唯一 |
+| DELETE | `/api/drip/samples/{id}` | 删除单个滴头样本并整轮重算 |
 
 ## 项目结构
 
 ```
-├── app.py              # Flask 路由 + SQLite 持久化（轮灌 + 水质 + 病害 + 积温）
+├── app.py              # Flask 路由 + SQLite 持久化（轮灌 + 水质 + 病害 + 积温 + 滴灌）
 ├── scheduler.py        # 轮灌编排与校验引擎（15 分钟槽）
 ├── water_quality.py    # 水质指标校验与「连续两次」状态机
 ├── disease_trace.py    # 病害接触追踪：确诊/到访/消毒按时间重放引擎
 ├── crop_heat.py        # 作物积温：温度截断 / 梯形积分 / 午夜拆分 / 缺口登记 / 7 完整日外推
+├── drip_uniform.py     # 滴灌巡检：低四分位 DU / 共享供压异常 / 支管压损 / 滴头堵塞判定
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -408,5 +584,7 @@ curl -OJ 'http://localhost:8000/api/heat/export?batch_id=1'
     ├── disease.js      # 案件 / 工具 / 事件登记 / 重放结果 / 筛选 / 导出
     ├── heat.html       # 积温预测页面结构
     ├── heat.js         # 批次 / 读数录入 / 曲线 / 日台账 / 缺口 / 外推 / 导出
-    └── style.css       # 时间轴等样式（water.css、disease.css、heat.css 为对应页面补充样式）
+    ├── drip.html       # 滴灌巡检页面结构
+    ├── drip.js         # 轮次 / 参数 / 首中尾样本录入 / 判定卡 / 维护清单 / 筛选 / 导出
+    └── style.css       # 时间轴等样式（water.css、disease.css、heat.css、drip.css 为对应页面补充样式）
 ```
