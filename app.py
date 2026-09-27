@@ -11,6 +11,7 @@ import scheduler
 import water_quality as wq
 import disease_trace as dt
 import crop_heat as ch
+import drip_du as du
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "data", "irrigation.db"))
@@ -153,6 +154,39 @@ def init_db():
             ON heat_readings(batch_id, ts);
         CREATE INDEX IF NOT EXISTS idx_heat_batches_zone
             ON heat_batches(zone_id);
+        -- 滴灌均匀度巡检：阀门 / 分区名称冗余落库（参照病害工具台账），
+        -- 日后阀门或分区被删除 / 改名，历史轮次仍按当时名称展示与导出。
+        CREATE TABLE IF NOT EXISTS du_rounds (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            valve_id     INTEGER REFERENCES valves(id) ON DELETE SET NULL,
+            valve_name   TEXT NOT NULL,
+            name         TEXT NOT NULL DEFAULT '',
+            inspected_at TEXT NOT NULL,
+            created      TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS du_zone_configs (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id          INTEGER NOT NULL REFERENCES du_rounds(id) ON DELETE CASCADE,
+            zone_id           INTEGER REFERENCES zones(id) ON DELETE SET NULL,
+            zone_name         TEXT NOT NULL,
+            baseline_pressure REAL NOT NULL,
+            design_flow       REAL NOT NULL,
+            du_min            REAL NOT NULL,
+            drop_threshold    REAL NOT NULL,
+            low_flow_ratio    REAL NOT NULL,
+            inlet_pressure    REAL NOT NULL,
+            UNIQUE (round_id, zone_id)
+        );
+        CREATE TABLE IF NOT EXISTS du_samples (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id INTEGER NOT NULL REFERENCES du_zone_configs(id) ON DELETE CASCADE,
+            position  TEXT NOT NULL CHECK (position IN ('head','mid','tail')),
+            seq       INTEGER NOT NULL,
+            flow      REAL NOT NULL,
+            UNIQUE (config_id, position, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_du_samples_config
+            ON du_samples(config_id, position, seq);
         """
     )
     _migrate_db(db)
@@ -169,6 +203,8 @@ def init_db():
         _seed_disease(db)
     if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
         _seed_heat(db)
+    if db.execute("SELECT COUNT(*) FROM du_rounds").fetchone()[0] == 0:
+        _seed_du(db)
     db.close()
 
 
@@ -447,6 +483,70 @@ def _seed_heat(db):
     db.commit()
 
 
+# ---------------------------------------------------------------- 滴灌均匀度巡检示例数据
+
+def _seed_du(db):
+    """两轮滴灌均匀度巡检示例（均挂在「中部干管」阀门，覆盖三类判定）。
+
+    轮次一（逐区判定）：黄瓜区入口合格、DU 不合格且尾首降幅 39% ≥ 10% -> 支管压损；
+    草莓区入口合格、DU 不合格但无系统性尾降 -> 2 个低于 设计×0.75 的疑似堵塞点；
+    叶菜区全部合格 -> 正常。
+    轮次二（共享供压异常）：黄瓜 / 草莓两区入口压力低于基准但 DU 合格，
+    2/3 超过半数 -> 整轮标记共享供压异常，不再逐区判定。
+    """
+    now = datetime.now().replace(microsecond=0)
+    valve = db.execute("SELECT id,name FROM valves WHERE name='中部干管'").fetchone()
+    if not valve:
+        return
+    zones = {r["name"]: r["id"] for r in db.execute(
+        "SELECT id,name FROM zones WHERE valve_id=?", (valve["id"],))}
+    needed = ["黄瓜区", "草莓区", "叶菜区"]
+    if not all(n in zones for n in needed):
+        return  # 分区被清空/改名时不强行演示
+
+    def grid(head, mid, tail):
+        return ([("head", i + 1, f) for i, f in enumerate(head)]
+                + [("mid", i + 1, f) for i, f in enumerate(mid)]
+                + [("tail", i + 1, f) for i, f in enumerate(tail)])
+
+    def add_round(name, days_ago, zone_rows):
+        inspected = (now - timedelta(days=days_ago)).replace(hour=9, minute=0, second=0)
+        cur = db.execute(
+            "INSERT INTO du_rounds(valve_id,valve_name,name,inspected_at,created)"
+            " VALUES(?,?,?,?,?)",
+            (valve["id"], valve["name"], name, inspected.isoformat(), now.isoformat()))
+        rid = cur.lastrowid
+        for zname, inlet, flows in zone_rows:
+            c = db.execute(
+                "INSERT INTO du_zone_configs(round_id,zone_id,zone_name,"
+                "baseline_pressure,design_flow,du_min,drop_threshold,low_flow_ratio,"
+                "inlet_pressure) VALUES(?,?,?,?,?,?,?,?,?)",
+                (rid, zones[zname], zname, du.DEFAULT_BASELINE_PRESSURE,
+                 du.DEFAULT_DESIGN_FLOW, du.DEFAULT_DU_MIN,
+                 du.DEFAULT_DROP_THRESHOLD, du.DEFAULT_LOW_FLOW_RATIO, inlet))
+            cid = c.lastrowid
+            for pos, seq, flow in flows:
+                db.execute(
+                    "INSERT INTO du_samples(config_id,position,seq,flow)"
+                    " VALUES(?,?,?,?)", (cid, pos, seq, flow))
+
+    add_round("9月中旬巡检", 6, [
+        # 首段 4.0~4.2、尾段 2.4~2.6：DU=0.75 < 0.8，尾首降幅 39% -> 支管压损
+        ("黄瓜区", 10.2, grid([4.2, 4.1, 4.0], [3.5, 3.4, 3.3], [2.6, 2.5, 2.4])),
+        # 首3 / 中3 两个低流量点（< 4×0.75=3.0），无系统性尾降 -> 疑似滴头堵塞
+        ("草莓区", 10.1, grid([4.0, 3.9, 2.2], [3.9, 3.8, 2.1], [3.8, 3.7, 3.9])),
+        # 全部约 4.0 L/h，DU≈0.97 -> 正常
+        ("叶菜区", 10.3, grid([4.0, 4.1, 3.9], [4.0, 3.8, 4.0], [3.9, 3.8, 4.0])),
+    ])
+    add_round("9月下旬复检", 1, [
+        # 入口 8.2 < 基准 10，但流量均匀（DU≈0.98）-> 计入共享供压信号
+        ("黄瓜区", 8.2, grid([3.2, 3.3, 3.1], [3.2, 3.1, 3.2], [3.1, 3.2, 3.1])),
+        ("草莓区", 8.4, grid([3.1, 3.2, 3.0], [3.1, 3.0, 3.2], [3.0, 3.1, 3.1])),
+        ("叶菜区", 10.1, grid([4.0, 3.9, 4.1], [4.0, 3.9, 4.0], [3.9, 4.0, 3.9])),
+    ])
+    db.commit()
+
+
 # ---------------------------------------------------------------- 序列化
 
 def valve_dict(row):
@@ -682,19 +782,22 @@ def api_reset():
     data = request.get_json(silent=True) or {}
     db = get_db()
     db.executescript(
+        "DELETE FROM du_samples; DELETE FROM du_zone_configs; DELETE FROM du_rounds; "
         "DELETE FROM heat_readings; DELETE FROM heat_batches; "
         "DELETE FROM schedule_items; DELETE FROM zones; "
         "DELETE FROM blackouts; DELETE FROM valves;"
     )
     if data.get("sample"):
         _seed_sample(db)
-        # 分区重建后补回水质 / 病害 / 积温示例（水源与案件如已被用户保留则不重复）
+        # 分区重建后补回水质 / 病害 / 积温 / 滴灌巡检示例（水源与案件等如已被用户保留则不重复）
         if db.execute("SELECT COUNT(*) FROM water_sources").fetchone()[0] == 0:
             _seed_water(db)
         if db.execute("SELECT COUNT(*) FROM disease_tools").fetchone()[0] == 0:
             _seed_disease(db)
         if db.execute("SELECT COUNT(*) FROM heat_batches").fetchone()[0] == 0:
             _seed_heat(db)
+        if db.execute("SELECT COUNT(*) FROM du_rounds").fetchone()[0] == 0:
+            _seed_du(db)
     else:
         db.execute("UPDATE settings SET value='100' WHERE key='total_flow'")
         db.commit()
@@ -1806,6 +1909,299 @@ def api_heat_delete_reading(reading_id):
     db.commit()
     # 删除后按时间全量重算
     return jsonify(build_heat_state(row["batch_id"]))
+
+
+# ---------------------------------------------------------------- API: 滴灌均匀度巡检
+
+def _du_round_full(db, round_row):
+    """取一轮巡检的全部配置与样本，整轮重算（本函数是唯一计算入口）。"""
+    zones = []
+    for cfg in db.execute(
+            "SELECT * FROM du_zone_configs WHERE round_id=? ORDER BY id",
+            (round_row["id"],)):
+        samples = [{"id": r["id"], "position": r["position"],
+                    "seq": r["seq"], "flow": r["flow"]}
+                   for r in db.execute(
+                       "SELECT * FROM du_samples WHERE config_id=?"
+                       " ORDER BY position,seq", (cfg["id"],))]
+        config = {"baseline_pressure": cfg["baseline_pressure"],
+                  "design_flow": cfg["design_flow"],
+                  "du_min": cfg["du_min"],
+                  "drop_threshold": cfg["drop_threshold"],
+                  "low_flow_ratio": cfg["low_flow_ratio"],
+                  "inlet_pressure": cfg["inlet_pressure"]}
+        result = du.compute_zone(config, samples)
+        zones.append({
+            "config_id": cfg["id"],
+            "zone_id": cfg["zone_id"],
+            "zone_name": cfg["zone_name"],
+            "zone_deleted": cfg["zone_id"] is None,
+            **result,
+        })
+    result = du.compute_round(zones)
+    return {
+        "id": round_row["id"],
+        "name": round_row["name"],
+        "valve_id": round_row["valve_id"],
+        "valve_name": round_row["valve_name"],
+        "valve_deleted": round_row["valve_id"] is None,
+        "inspected_at": round_row["inspected_at"],
+        "created": round_row["created"],
+        "zones": zones,
+        "result": result,
+    }
+
+
+def build_du_state(round_id=None, valve_id=None, status=None):
+    db = get_db()
+    valves = [{"id": r["id"], "name": r["name"]}
+              for r in db.execute("SELECT id,name FROM valves ORDER BY id")]
+    rounds = []
+    for row in db.execute(
+            "SELECT * FROM du_rounds ORDER BY inspected_at DESC, id DESC"):
+        full = _du_round_full(db, row)
+        rounds.append({
+            "id": full["id"], "name": full["name"],
+            "valve_id": full["valve_id"], "valve_name": full["valve_name"],
+            "valve_deleted": full["valve_deleted"],
+            "inspected_at": full["inspected_at"], "created": full["created"],
+            "zone_count": full["result"]["zone_count"],
+            "valid_zone_count": full["result"]["valid_zone_count"],
+            "shared_signal_count": full["result"]["shared_signal_count"],
+            "status": full["result"]["status"],
+            "status_label": full["result"]["status_label"],
+            "_full": full,
+        })
+
+    # 历史筛选：按阀门与整轮状态过滤列表；显式 round_id 不受筛选影响
+    visible = [r for r in rounds
+               if (valve_id is None or r["valve_id"] == valve_id)
+               and (status is None or r["status"] == status)]
+
+    selected = None
+    if round_id is not None:
+        hit = next((r for r in rounds if r["id"] == round_id), None)
+        if hit is None:
+            raise KeyError("巡检轮次不存在")
+        selected = hit["_full"]
+    elif visible:
+        selected = next((r for r in rounds if r["id"] == visible[0]["id"]), None)
+        selected = selected["_full"] if selected else None
+
+    for r in rounds:
+        r.pop("_full", None)
+    return {
+        "valves": valves,
+        "constants": {
+            "min_samples": du.MIN_SAMPLES,
+            "defaults": {
+                "baseline_pressure": du.DEFAULT_BASELINE_PRESSURE,
+                "design_flow": du.DEFAULT_DESIGN_FLOW,
+                "du_min": du.DEFAULT_DU_MIN,
+                "drop_threshold": du.DEFAULT_DROP_THRESHOLD,
+                "low_flow_ratio": du.DEFAULT_LOW_FLOW_RATIO,
+            },
+        },
+        "filters": {"valve_id": valve_id, "status": status},
+        "rounds": visible,
+        "selected_id": selected["id"] if selected else None,
+        "selected": selected,
+    }
+
+
+@app.route("/du")
+def du_page():
+    return send_from_directory(app.static_folder, "du.html")
+
+
+@app.get("/api/du/state")
+def api_du_state():
+    round_id = request.args.get("round_id", type=int)
+    valve_id = request.args.get("valve_id", type=int)
+    status = (request.args.get("status") or "").strip() or None
+    if status is not None and status not in du.ROUND_STATUSES:
+        return bad("状态筛选非法")
+    try:
+        return jsonify(build_du_state(round_id, valve_id, status))
+    except KeyError:
+        return bad("巡检轮次不存在", 404)
+
+
+@app.get("/api/du/export")
+def api_du_export():
+    round_id = request.args.get("round_id", type=int)
+    try:
+        state = build_du_state(round_id)
+    except KeyError:
+        return bad("巡检轮次不存在", 404)
+    if state["selected"] is None:
+        return bad("没有可导出的巡检轮次")
+    sel = state["selected"]
+    payload = {
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "round": {k: sel[k] for k in
+                  ("id", "name", "valve_id", "valve_name", "valve_deleted",
+                   "inspected_at", "created")},
+        "result": sel["result"],
+        "zones": sel["zones"],
+    }
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    fname = f"du-inspection-round-{sel['id']}.json"
+    resp = Response(body, mimetype="application/json; charset=utf-8")
+    resp.headers["Content-Disposition"] = \
+        f"attachment; filename=du-inspection.json; filename*=UTF-8''{fname}"
+    return resp
+
+
+# ---- 轮次 ----
+
+@app.post("/api/du/rounds")
+def api_du_create_round():
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    try:
+        valve_id = int(data.get("valve_id"))
+    except (TypeError, ValueError):
+        return bad("请选择巡检阀门")
+    vrow = db.execute("SELECT id,name FROM valves WHERE id=?", (valve_id,)).fetchone()
+    if not vrow:
+        return bad("请选择有效阀门")
+    try:
+        inspected_at = (du.parse_ts(data.get("inspected_at"))
+                        if data.get("inspected_at") not in (None, "")
+                        else datetime.now().replace(microsecond=0).isoformat())
+    except ValueError as e:
+        return bad(str(e))
+    zones = db.execute("SELECT id,name FROM zones WHERE valve_id=? ORDER BY id",
+                       (valve_id,)).fetchall()
+    if not zones:
+        return bad("该阀门下暂无分区，请先在轮灌编排台为分区绑定该阀门")
+    name = (data.get("name") or "").strip() or f"巡检 {inspected_at[:10]}"
+    now = datetime.now().replace(microsecond=0).isoformat()
+    cur = db.execute(
+        "INSERT INTO du_rounds(valve_id,valve_name,name,inspected_at,created)"
+        " VALUES(?,?,?,?,?)", (valve_id, vrow["name"], name, inspected_at, now))
+    rid = cur.lastrowid
+    # 为该阀门当前绑定的每个分区生成一套默认判定参数（实测入口压力先按基准填入）
+    for z in zones:
+        db.execute(
+            "INSERT INTO du_zone_configs(round_id,zone_id,zone_name,"
+            "baseline_pressure,design_flow,du_min,drop_threshold,low_flow_ratio,"
+            "inlet_pressure) VALUES(?,?,?,?,?,?,?,?,?)",
+            (rid, z["id"], z["name"], du.DEFAULT_BASELINE_PRESSURE,
+             du.DEFAULT_DESIGN_FLOW, du.DEFAULT_DU_MIN,
+             du.DEFAULT_DROP_THRESHOLD, du.DEFAULT_LOW_FLOW_RATIO,
+             du.DEFAULT_BASELINE_PRESSURE))
+    db.commit()
+    return jsonify(build_du_state(rid)), 201
+
+
+@app.put("/api/du/rounds/<int:round_id>")
+def api_du_update_round(round_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    if not db.execute("SELECT 1 FROM du_rounds WHERE id=?", (round_id,)).fetchone():
+        return bad("巡检轮次不存在", 404)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return bad("缺少字段：轮次名称")
+    try:
+        inspected_at = (du.parse_ts(data.get("inspected_at"))
+                        if data.get("inspected_at") not in (None, "")
+                        else None)
+    except ValueError as e:
+        return bad(str(e))
+    if inspected_at is not None:
+        db.execute("UPDATE du_rounds SET name=?,inspected_at=? WHERE id=?",
+                   (name, inspected_at, round_id))
+    else:
+        db.execute("UPDATE du_rounds SET name=? WHERE id=?", (name, round_id))
+    db.commit()
+    return jsonify(build_du_state(round_id))
+
+
+@app.delete("/api/du/rounds/<int:round_id>")
+def api_du_delete_round(round_id):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM du_rounds WHERE id=?", (round_id,)).fetchone():
+        return bad("巡检轮次不存在", 404)
+    db.execute(
+        "DELETE FROM du_samples WHERE config_id IN"
+        " (SELECT id FROM du_zone_configs WHERE round_id=?)", (round_id,))
+    db.execute("DELETE FROM du_zone_configs WHERE round_id=?", (round_id,))
+    db.execute("DELETE FROM du_rounds WHERE id=?", (round_id,))
+    db.commit()
+    return jsonify(build_du_state())
+
+
+# ---- 分区判定参数 ----
+
+@app.put("/api/du/configs/<int:config_id>")
+def api_du_update_config(config_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    row = db.execute("SELECT * FROM du_zone_configs WHERE id=?",
+                     (config_id,)).fetchone()
+    if not row:
+        return bad("分区判定参数不存在", 404)
+    try:
+        cfg = du.validate_config(data)
+    except ValueError as e:
+        return bad(str(e))
+    db.execute(
+        "UPDATE du_zone_configs SET baseline_pressure=?,design_flow=?,du_min=?,"
+        "drop_threshold=?,low_flow_ratio=?,inlet_pressure=? WHERE id=?",
+        (cfg["baseline_pressure"], cfg["design_flow"], cfg["du_min"],
+         cfg["drop_threshold"], cfg["low_flow_ratio"], cfg["inlet_pressure"],
+         config_id))
+    db.commit()
+    # 参数变更后整轮重算
+    return jsonify(build_du_state(row["round_id"]))
+
+
+# ---- 滴头流量样本 ----
+
+@app.post("/api/du/configs/<int:config_id>/samples")
+def api_du_add_samples(config_id):
+    data = request.get_json(silent=True)
+    db = get_db()
+    row = db.execute("SELECT * FROM du_zone_configs WHERE id=?",
+                     (config_id,)).fetchone()
+    if not row:
+        return bad("分区判定参数不存在", 404)
+    try:
+        if data is None:
+            raise ValueError("请求体必须为 JSON")
+        cleaned = du.validate_samples(data)
+    except ValueError as e:
+        return bad(str(e))
+    try:
+        for s in cleaned:
+            db.execute(
+                "INSERT INTO du_samples(config_id,position,seq,flow)"
+                " VALUES(?,?,?,?)",
+                (config_id, s["position"], s["seq"], s["flow"]))
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return bad("同一位置编号已有样本（首/中/尾 + 编号唯一），请检查批次")
+    # 补录后整轮重算
+    return jsonify(build_du_state(row["round_id"])), 201
+
+
+@app.delete("/api/du/samples/<int:sample_id>")
+def api_du_delete_sample(sample_id):
+    db = get_db()
+    row = db.execute(
+        "SELECT c.round_id rid FROM du_samples s"
+        " JOIN du_zone_configs c ON c.id=s.config_id WHERE s.id=?",
+        (sample_id,)).fetchone()
+    if not row:
+        return bad("样本不存在", 404)
+    db.execute("DELETE FROM du_samples WHERE id=?", (sample_id,))
+    db.commit()
+    # 删除后整轮重算
+    return jsonify(build_du_state(row["rid"]))
 
 
 # ---------------------------------------------------------------- 错误

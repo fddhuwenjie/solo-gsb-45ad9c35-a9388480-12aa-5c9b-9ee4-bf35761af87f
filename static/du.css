@@ -1,0 +1,80 @@
+/* 滴灌均匀度巡检页样式（复用 style.css / water.css / heat.css 的变量与基础组件） */
+
+/* ---------- 轮次 / 分区列表 ---------- */
+.round-item, .du-zone-item { cursor: pointer; flex-direction: column; align-items: stretch; gap: 3px; }
+.round-item .line1, .du-zone-item .line1 { display: flex; align-items: center; gap: 6px; }
+.round-item .meta, .du-zone-item .meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.valve-chip {
+  font-size: 10.5px; color: var(--green-dark); background: #e6f4e6;
+  border: 1px solid #b8dabb; border-radius: 999px; padding: 0 7px; white-space: nowrap;
+}
+.valve-chip.deleted, .zone-chip-deleted {
+  color: var(--ink-soft); background: #eef1ec; border-color: var(--line);
+}
+
+/* ---------- 整轮状态徽章（复用 .case-badge 基础样式） ---------- */
+.case-badge.r-normal { background: #e6f4e6; color: var(--green-dark); border: 1px solid #b8dabb; }
+.case-badge.r-shared { background: var(--red-bg); color: var(--red); border: 1px solid #f0b5af; }
+.case-badge.r-insufficient { background: #eef1ec; color: var(--ink-soft); border: 1px solid var(--line); }
+
+/* ---------- 分区判定徽章 ---------- */
+.judge-badge {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.judge-badge.j-ok   { background: #e6f4e6; color: var(--green-dark); border: 1px solid #b8dabb; }
+.judge-badge.j-warn { background: #fff4de; color: var(--amber); border: 1px solid #f0d49a; }
+.judge-badge.j-bad  { background: var(--red-bg); color: var(--red); border: 1px solid #f0b5af; }
+.judge-badge.j-none { background: #eef1ec; color: var(--ink-soft); border: 1px solid var(--line); }
+
+/* ---------- 总览 ---------- */
+.du-overview { padding: 12px 14px; }
+.basis-line {
+  list-style: none; margin: 10px 0 0; padding: 10px 0 0;
+  border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 12px; color: var(--ink-soft);
+}
+.basis-line li::before { content: "· "; }
+
+.maint-box { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.maint-box:empty { display: none; }
+.maint-title { margin: 0; font-size: 12.5px; font-weight: 700; }
+.maint-item {
+  font-size: 12.5px; border-radius: 8px; padding: 8px 12px; line-height: 1.5;
+}
+.maint-item.critical { background: var(--red-bg); border: 1px solid #f0b5af; color: var(--red); }
+.maint-item.warning { background: #fff4de; border: 1px solid #f0d49a; color: var(--amber); }
+.maint-item .maint-zone { font-weight: 700; margin-right: 4px; }
+.maint-empty {
+  font-size: 12.5px; border-radius: 8px; padding: 8px 12px;
+  background: #e6f4e6; border: 1px solid #b8dabb; color: var(--green-dark);
+}
+
+/* ---------- 图表 ---------- */
+.du-bar { fill: var(--green); opacity: .8; }
+.du-bar.j-warn { fill: #f0b429; }
+.du-bar.j-bad { fill: var(--red); opacity: .75; }
+.du-bar.j-none { fill: #b9c4b6; }
+.du-min-tick { stroke: var(--red); stroke-width: 1.4; stroke-dasharray: 4 2; }
+.du-flow-line { stroke: #1565c0; stroke-width: 1.2; stroke-dasharray: 5 3; }
+.du-threshold-line { stroke: var(--red); stroke-width: 1.2; stroke-dasharray: 5 3; }
+.du-pt { fill: var(--green-dark); stroke: #fff; stroke-width: 1.2; }
+.du-pt.low-q { stroke: #f0b429; stroke-width: 2.4; }
+.du-pt.below { fill: var(--red); }
+.du-seg-line { stroke: var(--line); stroke-width: 1; stroke-dasharray: 2 3; }
+
+/* ---------- 判定表 / 样本明细 ---------- */
+.du-table td.num-bad { color: var(--red); font-weight: 600; }
+.du-table td.num-ok { color: var(--green-dark); }
+.du-table tr.zone-pick { cursor: pointer; }
+.du-table tr.zone-pick.selected td { background: #eef6ec; }
+.du-table .basis-cell { white-space: normal; min-width: 260px; }
+.du-table .basis-cell ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 2px; }
+.du-table .basis-cell li { font-size: 11.5px; color: var(--ink-soft); }
+.tag {
+  display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 10.5px;
+  font-weight: 600; margin-right: 4px; white-space: nowrap;
+}
+.tag.low-q { background: #fff4de; color: var(--amber); border: 1px solid #f0d49a; }
+.tag.clog { background: var(--red-bg); color: var(--red); border: 1px solid #f0b5af; }

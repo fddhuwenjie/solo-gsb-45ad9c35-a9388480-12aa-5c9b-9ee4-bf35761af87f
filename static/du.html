@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>滴灌均匀度巡检</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/water.css">
+<link rel="stylesheet" href="/heat.css">
+<link rel="stylesheet" href="/du.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🚿</span>
+    <div>
+      <h1>滴灌均匀度巡检</h1>
+      <p class="subtitle">低四分位均值法 DU · 共享供压异常 / 支管压损 / 疑似滴头堵塞三级判定</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <nav class="page-tabs">
+      <a class="btn" href="/">💧 轮灌编排台</a>
+      <a class="btn" href="/water">🧪 水质监测</a>
+      <a class="btn" href="/disease">🔬 病害追踪</a>
+      <a class="btn" href="/heat">🌡️ 积温预测</a>
+      <a class="btn primary" href="/du">🚿 滴灌巡检</a>
+    </nav>
+    <button class="btn" id="btn-export">⬇ 导出 JSON</button>
+  </div>
+</header>
+
+<main class="water-layout du-layout">
+  <!-- 左侧：轮次 + 分区参数 + 样本录入 -->
+  <aside class="sidebar">
+    <section class="card">
+      <h2>巡检轮次 <small>选择一条阀门发起</small></h2>
+      <ul class="entity-list" id="round-list"></ul>
+      <form class="zone-form" id="round-form">
+        <label>轮次名称（可空，默认按日期命名）
+          <input type="text" name="name" placeholder="如：9 月下旬巡检">
+        </label>
+        <label>巡检阀门
+          <select name="valve_id" id="round-valve" required></select>
+        </label>
+        <label>巡检时间（本地时间，可空取当前）
+          <input type="datetime-local" name="inspected_at" step="1">
+        </label>
+        <div class="form-actions">
+          <button class="btn small primary" type="submit">新建巡检轮次</button>
+        </div>
+        <p class="form-hint">新建时为该阀门当前绑定的每个分区生成一套判定参数（默认值，可逐区修改）。</p>
+      </form>
+      <div class="case-ops">
+        <button class="btn small danger-solid" id="btn-round-delete" disabled>删除轮次</button>
+      </div>
+    </section>
+
+    <section class="card" id="zone-card">
+      <h2>分区判定参数 <small>每区独立 · 保存后整轮重算</small></h2>
+      <ul class="entity-list" id="zone-list"></ul>
+      <form class="zone-form" id="config-form">
+        <input type="hidden" name="config_id">
+        <div class="param-grid">
+          <label>基准入口压力 <small>m</small>
+            <input type="number" name="baseline_pressure" step="0.1" min="0.1" required>
+          </label>
+          <label>实测入口压力 <small>m</small>
+            <input type="number" name="inlet_pressure" step="0.1" min="0" required>
+          </label>
+          <label>设计滴头流量 <small>L/h</small>
+            <input type="number" name="design_flow" step="0.1" min="0.1" required>
+          </label>
+          <label>DU 下限 <small>0~1，如 0.8</small>
+            <input type="number" name="du_min" step="0.01" min="0.01" max="1" required>
+          </label>
+          <label>尾首降幅阈值 <small>0~1，如 0.1</small>
+            <input type="number" name="drop_threshold" step="0.01" min="0" max="0.99" required>
+          </label>
+          <label>低流量比例 <small>0~1，如 0.75</small>
+            <input type="number" name="low_flow_ratio" step="0.01" min="0.01" max="1" required>
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="btn small primary" type="submit" id="config-submit" disabled>保存参数并重算</button>
+        </div>
+        <p class="form-hint">DU = 低四分位均值 ÷ 全样本均值；尾首降幅 =（首段中位数 − 尾段中位数）÷ 首段中位数。</p>
+      </form>
+    </section>
+
+    <section class="card" id="sample-card">
+      <h2>滴头流量样本 <small>按首 / 中 / 尾编号 · 每区至少 8 个</small></h2>
+      <form class="zone-form" id="sample-form">
+        <div class="param-grid">
+          <label>位置
+            <select name="position">
+              <option value="head">首段</option>
+              <option value="mid">中段</option>
+              <option value="tail">尾段</option>
+            </select>
+          </label>
+          <label>编号
+            <input type="number" name="seq" min="1" max="9999" step="1" required>
+          </label>
+        </div>
+        <label>实测流量 <small>L/h（0 表示完全堵塞）</small>
+          <input type="number" name="flow" step="0.01" min="0" required>
+        </label>
+        <div class="form-actions">
+          <button class="btn small primary" type="submit" id="sample-submit" disabled>提交样本</button>
+        </div>
+      </form>
+      <form class="zone-form" id="batch-form">
+        <label>批量录入 <small>每行一条：位置 编号 流量（位置可用 首/中/尾 或 head/mid/tail）</small>
+          <textarea name="lines" rows="4" placeholder="首 1 4.05&#10;中 1 3.88&#10;尾 1 3.42"></textarea>
+        </label>
+        <div class="form-actions">
+          <button class="btn small" type="submit" id="batch-submit" disabled>批量提交</button>
+        </div>
+        <p class="form-hint">同一位置编号唯一；补录或删除样本后整轮自动重算。</p>
+      </form>
+    </section>
+  </aside>
+
+  <!-- 右侧：总览 + 图表 + 判定表 + 样本明细 -->
+  <section class="main-panel">
+    <div class="card du-overview">
+      <div class="overview-head">
+        <div class="overall">
+          <span class="overall-label" id="du-title">未选择巡检轮次</span>
+          <span class="case-badge" id="du-badge"></span>
+        </div>
+        <div class="filters">
+          <label>阀门筛选
+            <select id="filter-valve"></select>
+          </label>
+          <label>状态筛选
+            <select id="filter-status">
+              <option value="">全部状态</option>
+              <option value="normal">逐区判定</option>
+              <option value="shared_supply_anomaly">共享供压异常</option>
+              <option value="insufficient">数据不足</option>
+            </select>
+          </label>
+          <label>轮次
+            <select id="filter-round"></select>
+          </label>
+        </div>
+      </div>
+      <p class="case-meta" id="du-meta"></p>
+      <ul class="heat-stat-row" id="du-stats"></ul>
+      <ul class="basis-line" id="round-basis"></ul>
+      <div class="maint-box" id="maint-box"></div>
+    </div>
+
+    <div class="card">
+      <h2>DU 图表 <small id="chart-subtitle"></small></h2>
+      <div id="du-charts" class="heat-charts"></div>
+    </div>
+
+    <div class="card">
+      <h2>分区判定结果 <small id="zone-subtitle"></small></h2>
+      <div class="table-wrap">
+        <table class="sample-table du-table">
+          <thead>
+            <tr>
+              <th>分区</th><th>样本</th><th>低四分位均值</th><th>全样本均值</th>
+              <th>DU</th><th>DU 下限</th><th>入口 / 基准（m）</th><th>尾首降幅</th>
+              <th>判定</th><th>判定依据</th>
+            </tr>
+          </thead>
+          <tbody id="zone-rows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>样本明细 <small id="sample-subtitle"></small></h2>
+      <div class="table-wrap">
+        <table class="sample-table du-table">
+          <thead>
+            <tr><th>位置</th><th>编号</th><th>实测流量（L/h）</th><th>标记</th><th></th></tr>
+          </thead>
+          <tbody id="sample-rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/du.js"></script>
+</body>
+</html>
